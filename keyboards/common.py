@@ -18,7 +18,7 @@ def main_menu_keyboard(role: str) -> ReplyKeyboardMarkup:
             [KeyboardButton(text="🏢 Рабочие места"), KeyboardButton(text="🛠️ Админ-панель")]
         )
 
-    # !!! НОВАЯ КНОПКА: Выход
+    # Кнопка Выход
     buttons.append(
         [KeyboardButton(text="🚪 Выход")]
     )
@@ -44,13 +44,23 @@ def get_rating_keyboard(ticket_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
-# !!! НОВАЯ ФУНКЦИЯ: Клавиатура подтверждения выхода
 def confirm_logout_keyboard() -> InlineKeyboardMarkup:
     """Инлайн-клавиатура для подтверждения выхода."""
     buttons = [
         [
             InlineKeyboardButton(text="✅ Да, выйти", callback_data="logout_confirm"),
             InlineKeyboardButton(text="❌ Нет, остаться", callback_data="logout_cancel")
+        ]
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+# !!! ФУНКЦИЯ ДЛЯ КНОПКИ ЗАКРЫТИЯ ЗАЯВКИ (АДМИН)
+def get_admin_ticket_actions(ticket_id: int) -> InlineKeyboardMarkup:
+    """Кнопка 'Закрыть заявку' для администратора."""
+    buttons = [
+        [
+            InlineKeyboardButton(text="✅ Закрыть заявку", callback_data=f"admin_close_{ticket_id}")
         ]
     ]
     return InlineKeyboardMarkup(inline_keyboard=buttons)

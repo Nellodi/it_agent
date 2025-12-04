@@ -6,8 +6,10 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 
 from database import save_new_ticket, get_admin_telegram_ids, close_ticket_for_rating, finalize_ticket_rating, \
-    get_admin_info, get_user_tickets, get_user_role
-from keyboards.common import get_rating_keyboard
+    get_admin_info, get_user_tickets, get_user_role, get_full_user_profile, update_admin_rating
+
+# !!! ИМПОРТ ИСПРАВЛЕН: Добавлен get_admin_ticket_actions
+from keyboards.common import get_rating_keyboard, get_admin_ticket_actions
 
 logger = logging.getLogger(__name__)
 router = Router()
@@ -31,14 +33,9 @@ TICKET_PRIORITIES = ["Высокий", "Средний", "Низкий"]
 @router.message(F.text == "🆘 Создать заявку")
 async def cmd_create_ticket(message: types.Message, state: FSMContext):
     user_role = await get_user_role(message.from_user.id)
-
-    # !!! КЛЮЧЕВАЯ ДИАГНОСТИКА: Проверяем, почему не найдена роль
     if not user_role:
-        logger.warning(
-            f"TICKETS: Пользователь {message.from_user.id} не найден в БД при попытке создать заявку. Роль: {user_role}")
         await message.answer("⚠️ Вы не авторизованы. Начните с команды /start или /login.")
         return
-    # Если все ОК, продолжаем
 
     await message.answer("📝 <b>Новая заявка</b>\nВведите краткое <b>название/тему</b> проблемы:")
     await state.set_state(TicketStates.waiting_for_title)
@@ -81,8 +78,14 @@ async def finalize_ticket_creation(callback: types.CallbackQuery, state: FSMCont
 
     # 7. Заявка сохраняется в БД
     state_data = await state.get_data()
+    user_id = callback.from_user.id
+
+    # Получаем имя из парсера
+    user_profile = await get_full_user_profile(user_id)
+    user_full_name = user_profile['full_name'] if user_profile else "Неизвестный пользователь"
+
     try:
-        ticket_id, ticket_number = await save_new_ticket(callback.from_user.id, state_data)
+        ticket_id, ticket_number = await save_new_ticket(user_id, state_data)
     except Exception as e:
         logger.error(f"Ошибка сохранения заявки: {e}")
         await callback.message.edit_text("❌ Произошла ошибка при сохранении заявки. Попробуйте снова.")
@@ -94,17 +97,21 @@ async def finalize_ticket_creation(callback: types.CallbackQuery, state: FSMCont
 
     notification_text = (
         f"🚨 <b>НОВАЯ ЗАЯВКА</b>\n"
-        f"<b>Номер:</b> {ticket_number}\n"
+        f"<b>Номер:</b> {ticket_number} (ID: <code>{ticket_id}</code>)\n"
         f"<b>Тема:</b> {state_data['title']}\n"
         f"<b>Категория:</b> {state_data['category']}\n"
         f"<b>Приоритет:</b> {priority}\n"
-        f"<b>От пользователя:</b> {callback.from_user.full_name}\n\n"
-        f"Админ: Для закрытия используйте команду <code>/close_ticket {ticket_id}</code>"
+        f"<b>От пользователя:</b> {user_full_name}"  # Имя из БД
     )
 
     for admin_id in admin_ids:
         try:
-            await bot.send_message(chat_id=admin_id, text=notification_text)
+            # !!! КРИТИЧЕСКИЙ ВЫЗОВ: Добавляем кнопку закрытия
+            await bot.send_message(
+                chat_id=admin_id,
+                text=notification_text,
+                reply_markup=get_admin_ticket_actions(ticket_id)
+            )
         except Exception as e:
             logger.error(f"Не удалось отправить уведомление админу {admin_id}: {e}")
 
@@ -133,43 +140,49 @@ async def show_my_tickets(message: types.Message):
     for t in tickets:
         status_emoji = {"open": "🔴", "await_rating": "🟠", "closed": "🟢"}.get(t['status'], "⚪")
         response += (
-            f"{status_emoji} <b>{t['number']}</b>: {t['title']} "
+            f"{status_emoji} <b>{t['number']}</b> (ID: <code>{t['id']}</code>): {t['title']} "
             f"(Статус: <b>{t['status'].upper()}</b>)\n"
-            f"Создана: {t['created']}\n"
+            f"Создана: {t['created_at']}\n"  # Используем created_at, так как это ключ в dict
         )
 
     await message.answer(response)
 
 
 # =================================================================
-# 3. ЛОГИКА ЗАКРЫТИЯ И ОЦЕНКИ SYSADMIN'А
+# 3. ЛОГИКА ЗАКРЫТИЯ ПО КНОПКЕ (ADMIN)
 # =================================================================
 
-@router.message(Command("close_ticket"))
-async def cmd_close_ticket(message: types.Message, bot: Bot):
-    """Команда админа для закрытия заявки и запроса оценки."""
-    user_role = await get_user_role(message.from_user.id)
+@router.callback_query(F.data.startswith("admin_close_"))
+async def handle_admin_close_button(callback: types.CallbackQuery, bot: Bot):
+    """Обрабатывает нажатие кнопки 'Закрыть заявку'."""
+    user_role = await get_user_role(callback.from_user.id)
     if user_role != 'admin':
-        await message.answer("🚫 Команда только для администраторов.")
+        await callback.answer("🚫 У вас нет прав администратора.")
         return
 
-    parts = message.text.split()
-    if len(parts) < 2 or not parts[1].isdigit():
-        await message.answer(
-            "❌ Используйте формат: <code>/close_ticket [ID заявки]</code> (ID заявки — это ID из БД, который виден в уведомлении).")
+    try:
+        # Извлекаем ID заявки из callback_data: admin_close_123
+        ticket_id = int(callback.data.split('_')[-1])
+    except ValueError:
+        await callback.answer("❌ Неверный формат ID заявки.")
         return
 
-    ticket_id = int(parts[1])
-    admin_id = message.from_user.id
+    admin_id = callback.from_user.id
 
+    # Обновляем статус заявки и получаем user_id создателя
     creator_id = await close_ticket_for_rating(ticket_id, admin_id)
 
     if creator_id is None:
-        await message.answer(f"❌ Заявка с ID {ticket_id} не найдена или уже закрыта.")
+        await callback.message.edit_text(f"❌ Заявка ID <code>{ticket_id}</code> не найдена или уже закрыта.",
+                                         reply_markup=None)
+        await callback.answer()
         return
 
-    await message.answer(f"✅ Заявка ID {ticket_id} переведена в статус 'Ожидает оценки'.")
+    # Изменяем сообщение для админа, чтобы убрать кнопку и показать статус
+    await callback.message.edit_text(f"✅ Вы перевели заявку ID <code>{ticket_id}</code> в статус 'Ожидает оценки'.",
+                                     reply_markup=None)
 
+    # Отправляем запрос на оценку пользователю
     try:
         await bot.send_message(
             chat_id=creator_id,
@@ -181,6 +194,12 @@ async def cmd_close_ticket(message: types.Message, bot: Bot):
     except Exception as e:
         logger.error(f"Не удалось отправить запрос на оценку пользователю {creator_id}: {e}")
 
+    await callback.answer("Заявка закрыта, ожидаем оценку пользователя.")
+
+
+# =================================================================
+# 4. ОБРАБОТКА ОЦЕНКИ
+# =================================================================
 
 @router.callback_query(F.data.startswith("rate_"))
 async def process_rating(callback: types.CallbackQuery, bot: Bot):
@@ -193,6 +212,9 @@ async def process_rating(callback: types.CallbackQuery, bot: Bot):
     result = await finalize_ticket_rating(ticket_id, rating)
 
     if result:
+        # !!! КРИТИЧЕСКИЙ ВЫЗОВ: Обновление рейтинга
+        await update_admin_rating(result['admin_id'], result['rating'])
+
         admin_info = await get_admin_info(result['admin_id'])
 
         await callback.message.edit_text(
@@ -215,41 +237,11 @@ async def process_rating(callback: types.CallbackQuery, bot: Bot):
 
     await callback.answer()
 
-    @router.callback_query(F.data.startswith("rate_"))
-    async def process_rating(callback: types.CallbackQuery, bot: Bot):
-        """Обработка нажатия на инлайн-кнопку оценки."""
 
-        parts = callback.data.split('_')
-        ticket_id = int(parts[1])
-        rating = int(parts[2])
+# =================================================================
+# 5. УСТАРЕВШАЯ КОМАНДА (Удалена, но оставлена заглушка)
+# =================================================================
 
-        # 1. Завершаем оценку и получаем данные
-        result = await finalize_ticket_rating(ticket_id, rating)
-
-        if result:
-            # !!! КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ: Вызываем асинхронную функцию обновления рейтинга
-            await update_admin_rating(result['admin_id'], result['rating'])
-
-            admin_info = await get_admin_info(result['admin_id'])
-
-            # 2. Сообщаем пользователю об успехе
-            await callback.message.edit_text(
-                f"🌟 Спасибо за вашу оценку в <b>{rating} звезд</b>! Заявка {result['ticket_number']} закрыта."
-            )
-
-            # 3. Сообщаем администратору
-            if admin_info:
-                admin_msg = (
-                    f"🎉 <b>ПОЛУЧЕНА ОЦЕНКА!</b>\n\n"
-                    f"Заявка {result['ticket_number']} была оценена пользователем на <b>{rating} звезд</b>.\n"
-                    f"Ваш средний рейтинг теперь: <b>{admin_info['avg_rating']}/5.0 ⭐️</b>"
-                )
-                try:
-                    await bot.send_message(result['admin_id'], admin_msg)
-                except Exception as e:
-                    logger.error(f"Не удалось уведомить админа {result['admin_id']} о рейтинге: {e}")
-
-        else:
-            await callback.message.edit_text("❌ Ошибка: Не удалось обработать оценку. Возможно, заявка уже закрыта.")
-
-        await callback.answer()
+@router.message(Command("close_ticket"))
+async def cmd_close_ticket_deprecated(message: types.Message):
+    await message.answer("Эта команда заменена кнопкой '✅ Закрыть заявку' в уведомлении о новой заявке.")
