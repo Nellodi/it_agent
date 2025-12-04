@@ -8,3 +8,4 @@ from .admin import router as admin_router
 from .admin_tickets import router as admin_tickets_router
 from .equipment import router as equipment_router
 from .workplaces import router as workplaces_router
+from .faq import router as faq_router # Новый роутер FAQ

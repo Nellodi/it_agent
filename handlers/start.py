@@ -5,7 +5,7 @@ from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 
 from database import get_user_role
-from keyboards.common import main_menu_keyboard  # Убедитесь, что этот импорт есть
+from keyboards.common import main_menu_keyboard, get_start_auth_keyboard
 
 logger = logging.getLogger(__name__)
 router = Router()
@@ -15,31 +15,34 @@ router = Router()
 async def cmd_start(message: types.Message, state: FSMContext):
     """
     Обработка команды /start.
-    Проверяет авторизацию: если пользователь в БД, показывает меню; иначе предлагает авторизоваться.
+    Показывает меню, если авторизован, или кнопку входа.
     """
 
-    user_role = await get_user_role(message.from_user.id)
+    user_id = message.from_user.id
+    user_role = await get_user_role(user_id)
+
+    await state.clear()
 
     if user_role:
-        await state.clear()
-        # Используем HTML-форматирование
+        # Если авторизован, показываем главное меню
         await message.answer(
             f"👤 С возвращением! Вы авторизованы как <b>{user_role.upper()}</b>.",
             reply_markup=main_menu_keyboard(user_role)
         )
-        logger.info(f"START: Пользователь {message.from_user.id} уже авторизован с ролью {user_role}.")
+        logger.info(f"START: Пользователь {user_id} авторизован с ролью {user_role}.")
     else:
+        # Если не авторизован, показываем кнопку входа
         await message.answer(
             "🏢 <b>IT-Экосистема</b>\n\n"
-            "Добро пожаловать! Для начала работы необходимо войти в систему.\n"
-            "Нажмите /login, чтобы начать авторизацию."
+            "Добро пожаловать! Для начала работы необходимо войти в систему.",
+            reply_markup=get_start_auth_keyboard()
         )
-        logger.info(f"START: Пользователь {message.from_user.id} не авторизован. Предложено /login.")
+        logger.info(f"START: Пользователь {user_id} не авторизован. Предложена кнопка входа.")
 
 
 @router.message(Command("check_role"))
 async def cmd_check_role(message: types.Message):
-    """Диагностическая команда для проверки текущей роли в БД."""
+    """Диагностическая команда для проверки текущей роли в БД (оставляем для отладки)."""
     user_id = message.from_user.id
     user_role = await get_user_role(user_id)
 

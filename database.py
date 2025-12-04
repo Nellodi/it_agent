@@ -1,8 +1,9 @@
-# Файл: it_ecosystem_bot/database.py
+﻿# Файл: it_ecosystem_bot/database.py
 import sqlite3
 import asyncio
 import logging
 import time
+import os
 from typing import Dict, Any, List, Tuple, Optional
 import re
 
@@ -89,6 +90,135 @@ def _ensure_workplaces_columns_and_tables():
     conn.commit()
     conn.close()
 
+def _seed_default_workplaces():
+    """Автосоздание рабочих мест по умолчанию, если их нет."""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    for sql in [
+        'ALTER TABLE workplaces ADD COLUMN floor INTEGER',
+        'ALTER TABLE workplaces ADD COLUMN primary_pc TEXT',
+        'ALTER TABLE workplaces ADD COLUMN peripherals TEXT',
+    ]:
+        try:
+            c.execute(sql)
+        except Exception:
+            pass
+
+    def upsert(number: str, floor: int):
+        c.execute('SELECT id FROM workplaces WHERE number=?', (number,))
+        row = c.fetchone()
+        if row:
+            c.execute('UPDATE workplaces SET floor=?, primary_pc=? WHERE id=?', (floor, number, row[0]))
+        else:
+            c.execute('INSERT INTO workplaces (number, department, location, floor, primary_pc) VALUES (?, ?, ?, ?, ?)',
+                      (number, None, None, floor, number),)
+
+    for num in range(2001, 2093):
+        upsert(f'TSS-WS-{num}', 2)
+    for num in range(1, 73):
+        upsert(f'TSS-WS-{num:03d}', 4)
+    for num in range(5001, 5063):
+        upsert(f'TSS-WS-{num}', 5)
+
+    conn.commit()
+    conn.close()
+
+
+def import_users_from_excel(file_path: str = "users.xlsx"):
+    """Импортирует пользователей из Excel в auth_directory (замена Excel-парсера)."""
+    try:
+        from openpyxl import load_workbook
+    except ImportError:
+        logger.error("openpyxl не установлен, импорт из Excel невозможен.")
+        return
+
+    if not os.path.exists(file_path):
+        logger.warning(f"Файл {file_path} не найден, пропускаем импорт.")
+        return
+
+    wb = load_workbook(file_path)
+    ws = wb.active
+    headers = [cell.value for cell in ws[1]]
+
+    def col(name: str) -> int | None:
+        try:
+            return headers.index(name)
+        except ValueError:
+            return None
+
+    idx_name = col("Name")
+    idx_dept = col("Department")
+    idx_pos = col("Position")
+    idx_login = col("Login")
+    idx_pass = col("Password")
+    idx_email = col("Email Address")
+    idx_status = col("Status")
+
+    if idx_login is None or idx_pass is None:
+        logger.error("В Excel нет столбцов Login/Password, импорт невозможен.")
+        return
+
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+
+    count = 0
+    for row in ws.iter_rows(min_row=2, values_only=True):
+        login = (row[idx_login] or "").strip().lower()
+        password = (row[idx_pass] or "").strip()
+        if not login or not password:
+            continue
+
+        status = (row[idx_status] or "").lower() if idx_status is not None else ""
+        if "terminated" in status or "❌" in status:
+            continue  # пропускаем уволенных
+
+        full_name = row[idx_name] if idx_name is not None else None
+        dept = row[idx_dept] if idx_dept is not None else None
+        pos = row[idx_pos] if idx_pos is not None else None
+        email = row[idx_email] if idx_email is not None else None
+
+        try:
+            c.execute("""
+                INSERT OR REPLACE INTO auth_directory (login, password, full_name, department, position, role, email)
+                VALUES (?, ?, ?, ?, ?, COALESCE((SELECT role FROM auth_directory WHERE login=?), 'user'), ?)
+            """, (login, password, full_name, dept, pos, login, email))
+            count += 1
+        except sqlite3.Error as e:
+            logger.error(f"DB: ошибка импорта пользователя {login}: {e}")
+
+    conn.commit()
+    conn.close()
+    logger.info(f"Импортировано пользователей в auth_directory: {count}")
+
+
+async def get_auth_directory_user(login: str) -> Optional[Dict[str, str]]:
+    """Получить запись пользователя из справочника auth_directory по логину."""
+
+    def _get():
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT login, password, full_name, department, position, role, email
+            FROM auth_directory
+            WHERE login = ?
+        """, (login.lower(),))
+        row = cursor.fetchone()
+        conn.close()
+        if not row:
+            return None
+        return {
+            "login": row[0],
+            "password": row[1],
+            "full_name": row[2],
+            "department": row[3],
+            "position": row[4],
+            "role": row[5],
+            "email": row[6],
+        }
+
+    return await asyncio.to_thread(_get)
+
+
 
 async def init_db():
     """Инициализирует базу данных и создает все необходимые таблицы."""
@@ -170,12 +300,37 @@ async def init_db():
             )
         """)
 
+        # 9. Таблица: faq_materials (КРИТИЧЕСКИ ВАЖНО)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS faq_materials (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, 
+                title TEXT NOT NULL, 
+                description TEXT,
+                file_id TEXT,
+                file_type TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        # 10. Таблица: auth_directory (справочник логинов/паролей)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS auth_directory (
+                login TEXT PRIMARY KEY,
+                password TEXT NOT NULL,
+                full_name TEXT,
+                department TEXT,
+                position TEXT,
+                role TEXT DEFAULT 'user',
+                email TEXT
+            )
+        """)
+
         conn.commit()
         conn.close()
 
     await asyncio.to_thread(create_tables)
     await asyncio.to_thread(_ensure_workplaces_columns_and_tables)
-
+    await asyncio.to_thread(_seed_default_workplaces)
 
 # --- ОСНОВНЫЕ ФУНКЦИИ ПОЛЬЗОВАТЕЛЯ И АВТОРИЗАЦИИ ---
 
@@ -270,27 +425,39 @@ async def remove_authorized_user(telegram_id: int) -> bool:
 
 # --- ФУНКЦИИ УПРАВЛЕНИЯ ЗАЯВКАМИ ---
 
-async def save_new_ticket(user_id: int, data: Dict[str, str]) -> Tuple[int, str]:
-    """Сохраняет новую заявку и возвращает ее ID и номер."""
+async def save_new_ticket(user_id: int, data: Dict[str, Any]) -> Tuple[int, str]:
+    """��������� ����� ������ � ������� (id, �����)."""
 
     def insert_ticket():
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
         date_part = time.strftime("%y%m%d", time.localtime())
-        cursor.execute(f"SELECT MAX(ticket_number) FROM tickets WHERE ticket_number LIKE 'TK{date_part}%'")
+        cursor.execute(f"SELECT MAX(ticket_number) FROM tickets WHERE ticket_number LIKE 'TK{date_part}%'" )
         last_num = cursor.fetchone()[0]
 
-        if last_num:
-            sequence = int(last_num[-4:]) + 1
-        else:
-            sequence = 1
-
+        sequence = int(last_num[-4:]) + 1 if last_num else 1
         ticket_number = f"TK{date_part}{sequence:04d}"
 
-        cursor.execute("""
-            INSERT INTO tickets (user_id, ticket_number, title, description, category, priority)
-            VALUES (?, ?, ?, ?, ?, ?)
-        """, (user_id, ticket_number, data['title'], data['description'], data['category'], data['priority']))
+        columns = ["user_id", "ticket_number", "title", "description", "category", "priority"]
+        values = [
+            user_id,
+            ticket_number,
+            data.get('title'),
+            data.get('description'),
+            data.get('category'),
+            data.get('priority', 'medium')
+        ]
+
+        if 'floor' in data:
+            columns.append("floor")
+            values.append(data.get('floor'))
+        if 'workplace' in data:
+            columns.append("pc_name")
+            values.append(data.get('workplace'))
+
+        cols_sql = ", ".join(columns)
+        placeholders = ", ".join(["?"] * len(values))
+        cursor.execute(f"INSERT INTO tickets ({cols_sql}) VALUES ({placeholders})", values)
 
         ticket_id = cursor.lastrowid
         conn.commit()
@@ -764,7 +931,7 @@ async def delete_equipment(inv_number: str) -> bool:
     return await asyncio.to_thread(_delete)
 
 
-# --- ФУНКЦИИ ДЛЯ ПОЛЬЗОВАТЕЛЬСКОГО ИНТЕРФЕЙСА ---
+# --- ФУНКЦИИ ДЛЯ ПОЛЬЗОВАТЕЛЬСКОГО ИНТЕРФЕЙСА (ПОВТОРНОЕ ОПРЕДЕЛЕНИЕ) ---
 
 async def get_user_equipment(user_id: int) -> List[Dict]:
     """Получает список оборудования, назначенного пользователю."""
@@ -870,7 +1037,7 @@ async def get_workplace_equipment(workplace_id: int) -> List[Dict]:
 
 
 async def get_all_workplaces() -> List[Dict]:
-    """!!! ФУНКЦИЯ get_all_workplaces !!! Получает список всех рабочих мест."""
+    """Получает список всех рабочих мест."""
 
     def fetch_all():
         conn = sqlite3.connect(DB_PATH)
@@ -966,3 +1133,246 @@ def get_floor_from_ip(ip: str, hostname: Optional[str] = None) -> Optional[int]:
     if ip.startswith('172.20.31.'): return 5
     if hostname: return get_floor_from_hostname(hostname)
     return None
+
+
+async def get_available_floors() -> List[int]:
+    """Возвращает список уникальных номеров этажей из таблицы workplaces."""
+
+    def fetch_floors():
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("SELECT DISTINCT floor FROM workplaces WHERE floor IS NOT NULL ORDER BY floor ASC")
+        floors = [row[0] for row in cursor.fetchall()]
+        conn.close()
+        allowed = {2, 4, 5}
+        filtered = [f for f in floors if f in allowed]
+        return filtered if filtered else sorted(list(allowed))
+
+    return await asyncio.to_thread(fetch_floors)
+
+
+async def get_workplaces_by_floor(floor: int) -> List[Dict]:
+    """Возвращает рабочие места для указанного этажа."""
+
+    def fetch_workplaces():
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("SELECT number, primary_pc FROM workplaces WHERE floor = ? ORDER BY number ASC", (floor,))
+        workplaces = []
+        for row in cursor.fetchall():
+            workplaces.append({'number': row[0], 'pc_name': row[1]})
+        conn.close()
+        return workplaces
+
+    workplaces = await asyncio.to_thread(fetch_workplaces)
+    # Если таблица пустая (новая БД) — повторно выполним автосоздание и перечитаем.
+    if not workplaces:
+        await asyncio.to_thread(_seed_default_workplaces)
+        workplaces = await asyncio.to_thread(fetch_workplaces)
+    return workplaces
+
+
+async def get_all_users_for_mailing() -> list[int]:
+    """Получает Telegram ID всех активных пользователей для рассылки."""
+
+    def _get_ids():
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("SELECT telegram_id FROM authorized_users")
+        user_ids = [row[0] for row in cursor.fetchall()]
+        conn.close()
+        return user_ids
+
+    return await asyncio.to_thread(_get_ids)
+
+
+# --- Вложения к заявкам ---
+
+async def add_ticket_attachment(ticket_id: int, file_id: str, file_type: str = "photo",
+                                file_name: Optional[str] = None) -> bool:
+    """Сохранить вложение к заявке."""
+
+    def _add():
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        try:
+            cursor.execute("""
+                INSERT INTO ticket_attachments (ticket_id, file_id, file_type, file_name)
+                VALUES (?, ?, ?, ?)
+            """, (ticket_id, file_id, file_type, file_name))
+            conn.commit()
+            return True
+        except sqlite3.Error as e:
+            logger.error(f"DB: ошибка добавления вложения для заявки {ticket_id}: {e}")
+            return False
+        finally:
+            conn.close()
+
+    return await asyncio.to_thread(_add)
+
+
+# --- FAQ ---
+
+async def add_faq_item(question: str, answer: str) -> bool:
+    """Добавить пункт в FAQ."""
+
+    def _add():
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        try:
+            cursor.execute("INSERT INTO faq (question, answer) VALUES (?, ?)", (question, answer))
+            conn.commit()
+            return True
+        except sqlite3.Error as e:
+            logger.error(f"DB: ошибка добавления FAQ: {e}")
+            return False
+        finally:
+            conn.close()
+
+    return await asyncio.to_thread(_add)
+
+
+async def get_faq_items(limit: Optional[int] = None) -> List[Dict]:
+    """Получить список FAQ (последние сверху)."""
+
+    def _get():
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        query = "SELECT id, question, answer, created_at FROM faq ORDER BY created_at DESC"
+        if limit:
+            query += f" LIMIT {int(limit)}"
+        cursor.execute(query)
+        items = []
+        for row in cursor.fetchall():
+            items.append({
+                "id": row[0],
+                "question": row[1],
+                "answer": row[2],
+                "created_at": row[3],
+            })
+        conn.close()
+        return items
+
+    return await asyncio.to_thread(_get)
+
+
+async def delete_faq_item(faq_id: int) -> bool:
+    """Удалить пункт FAQ."""
+
+    def _delete():
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        try:
+            cursor.execute("DELETE FROM faq WHERE id = ?", (faq_id,))
+            conn.commit()
+            return cursor.rowcount > 0
+        except sqlite3.Error as e:
+            logger.error(f"DB: ошибка удаления FAQ {faq_id}: {e}")
+            return False
+        finally:
+            conn.close()
+
+    return await asyncio.to_thread(_delete)
+
+
+async def save_faq_material(title: str, description: str, file_info: Optional[Dict] = None) -> Dict | None:
+    """Сохраняет новый материал FAQ и возвращает его данные для рассылки."""
+
+    def _save():
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+
+        file_id = file_info.get('id') if file_info else None
+        file_type = file_info.get('type') if file_info else None
+
+        try:
+            # Убедитесь, что таблица 'faq_materials' создана в init_db
+            cursor.execute("""
+                INSERT INTO faq_materials (title, description, file_id, file_type)
+                VALUES (?, ?, ?, ?)
+            """, (title, description, file_id, file_type))
+
+            faq_id = cursor.lastrowid
+            conn.commit()
+            return {'id': faq_id, 'title': title, 'description': description, 'file_id': file_id,
+                    'file_type': file_type}
+        except sqlite3.Error as e:
+            logger.error(f"DB: Ошибка сохранения FAQ: {e}")
+            return None
+        finally:
+            conn.close()
+
+    return await asyncio.to_thread(_save)
+
+
+async def get_latest_faq_material() -> Dict | None:
+    """Получает самый свежий материал FAQ для рассылки."""
+
+    def _get():
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT id, title, description, file_id, file_type 
+            FROM faq_materials 
+            ORDER BY created_at DESC LIMIT 1
+        """)
+        row = cursor.fetchone()
+        conn.close()
+        if row:
+            return {
+                'id': row[0], 'title': row[1], 'description': row[2], 'file_id': row[3], 'file_type': row[4],
+            }
+        return None
+
+    return await asyncio.to_thread(_get)
+
+
+async def get_all_faq_materials() -> list[dict]:
+    """Получает список всех сохраненных материалов FAQ/гайдов."""
+
+    def _get_all():
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT id, title, description, file_id, file_type 
+            FROM faq_materials 
+            ORDER BY created_at DESC
+        """)
+        columns = [desc[0] for desc in cursor.description]
+        # Преобразуем результат в список словарей для удобства
+        faq_list = [dict(zip(columns, row)) for row in cursor.fetchall()]
+        conn.close()
+        return faq_list
+
+    return await asyncio.to_thread(_get_all)
+
+
+async def get_user_credentials(telegram_id: int) -> List[Dict]:
+    """Получить сохраненные доступы пользователя."""
+
+    def _get():
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT service, login, password, url, note, created_at
+            FROM user_credentials
+            WHERE telegram_id = ?
+            ORDER BY created_at DESC
+        """, (telegram_id,))
+        rows = cursor.fetchall()
+        conn.close()
+        creds = []
+        for r in rows:
+            creds.append({
+                "service": r[0],
+                "login": r[1],
+                "password": r[2],
+                "url": r[3],
+                "note": r[4],
+                "created_at": r[5],
+            })
+        return creds
+
+    return await asyncio.to_thread(_get)
+
+

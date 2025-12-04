@@ -1,4 +1,5 @@
 # Файл: it_ecosystem_bot/handlers/admin_tickets.py
+# -*- coding: utf-8 -*-
 import logging
 from aiogram import Router, types, F
 from aiogram.filters import Command, StateFilter
@@ -391,4 +392,10 @@ async def show_ticket_history(callback: types.CallbackQuery):
     kb.button(text="« Назад", callback_data=f"ticket_detail_{ticket_id}")
     
     await callback.message.edit_text(text, reply_markup=kb.as_markup())
+    await callback.answer()
+
+@router.callback_query(F.data == "menu_all_tickets")
+async def menu_all_tickets(callback: types.CallbackQuery):
+    """�������� ���� ������ �� inline-����."""
+    await cmd_view_all_tickets(callback.message)
     await callback.answer()
